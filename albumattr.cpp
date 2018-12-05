@@ -1,7 +1,7 @@
 /* albumattr - detects albums in folders and set some attributes
-**
-** Copyright (c) 2003-2004 pinc Software. All Rights Reserved.
-*/
+ *
+ * Copyright (c) 2003-2018 pinc Software. All Rights Reserved.
+ */
 
 
 #include <Application.h>
@@ -27,6 +27,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+
+#include <taglib/attachedpictureframe.h>
+#include <taglib/id3v2frame.h>
+#include <taglib/id3v2header.h>
+#include <taglib/id3v2tag.h>
+#include <taglib/mpegfile.h>
 
 #include "AlbumIcon.h"
 
@@ -59,6 +65,7 @@ struct album_attrs {
 	int32 length;
 	int32 min_year;
 	int32 max_year;
+	BBitmap* cover;
 };
 
 struct audio_attrs {
@@ -67,6 +74,7 @@ struct audio_attrs {
 	BString genre;
 	int32 length;
 	int32 year;
+	BBitmap* cover;
 };
 
 
@@ -219,7 +227,49 @@ readAttributeString(BNode &node, const char *attribute, BString &string)
 
 
 status_t
-retrieveFromFile(BFile &file, audio_attrs &audioAttrs)
+retrieveFromID3Tags(BEntry& entry, audio_attrs& audioAttrs)
+{
+	BPath path;
+	status_t status = entry.GetPath(&path);
+	if (status != B_OK)
+		return status;
+
+	TagLib::MPEG::File file(path.Path());
+	TagLib::ID3v2::Tag* fileTags = file.ID3v2Tag();
+
+	if (fileTags != NULL) {
+		// Find frame containing pictures
+		TagLib::ID3v2::FrameList frame = fileTags->frameList("APIC");
+		TagLib::ID3v2::AttachedPictureFrame* coverFrame = NULL;
+		if (!frame.isEmpty()) {
+			// Search for the album image
+			// (one frame can contain multiple images)
+			TagLib::ID3v2::FrameList::ConstIterator iterator = frame.begin();
+			for (; iterator != frame.end(); iterator++) {
+				TagLib::ID3v2::AttachedPictureFrame* pictureFrame
+					= static_cast<TagLib::ID3v2::AttachedPictureFrame*>(*iterator);
+				if (pictureFrame->type()
+						== TagLib::ID3v2::AttachedPictureFrame::FrontCover) {
+					coverFrame = pictureFrame;
+				}
+			}
+
+			if (coverFrame != NULL) {
+				BMemoryIO memoryIO(coverFrame->picture().data(),
+					coverFrame->picture().size());
+
+				audioAttrs.cover = BTranslationUtils::GetBitmap(&memoryIO);
+			}
+		}
+	}
+
+	// TODO: read other tags, and write them back to the attributes
+	return B_OK;
+}
+
+
+status_t
+retrieveFromAttrs(BFile& file, audio_attrs& audioAttrs)
 {
 	readAttributeString(file, "Audio:Artist", audioAttrs.artist);
 	readAttributeString(file, "Audio:Album", audioAttrs.album);
@@ -308,6 +358,8 @@ handleFile(BEntry &entry, audio_attrs &audioAttrs, int32 &fileType)
 	char name[B_FILE_NAME_LENGTH];
 	entry.GetName(name);
 
+	audioAttrs.cover = NULL;
+
 	// if it is not an audio file, return
 
 	fileType = getFileType(entry);
@@ -327,18 +379,21 @@ handleFile(BEntry &entry, audio_attrs &audioAttrs, int32 &fileType)
 
 	// retrieve attributes
 
-	return retrieveFromFile(file, audioAttrs);
+	status_t status = retrieveFromAttrs(file, audioAttrs);
+	if (status == B_OK)
+		retrieveFromID3Tags(entry, audioAttrs);
+	return status;
 }
 
 
 void
-createIcon(BNodeInfo &targetInfo, BNodeInfo &imageInfo, BBitmap *source, icon_size type)
+createIcon(BNodeInfo& targetInfo, BNodeInfo* imageInfo, BBitmap* source, icon_size type)
 {
 	BBitmap icon(BRect(0, 0, type - 1, type - 1), B_COLOR_8_BIT, true);
 	if (targetInfo.GetIcon(&icon, type) == B_OK && !gForce)
 		return;
 
-	if (!gUseImageIcon || imageInfo.GetIcon(&icon, type) != B_OK) {
+	if (!gUseImageIcon || imageInfo == NULL || imageInfo->GetIcon(&icon, type) != B_OK) {
 		BView *view = new BView(icon.Bounds(), "icon", B_FOLLOW_NONE, 0);
 
 		icon.AddChild(view);
@@ -355,23 +410,35 @@ createIcon(BNodeInfo &targetInfo, BNodeInfo &imageInfo, BBitmap *source, icon_si
 
 
 void
-createCoverIcons(BEntry &target, entry_ref &image)
+createCoverIcons(BEntry& target, BBitmap* image, entry_ref* imageRef)
 {
 	BNode targetNode(&target);
 	BNodeInfo targetInfo(&targetNode);
 	if (targetInfo.InitCheck() != B_OK)
 		return;
 
-	BNode imageNode(&image);
-	BNodeInfo imageInfo(&imageNode);
-	if (imageInfo.InitCheck() != B_OK)
-		return;
+	BNodeInfo* imageInfo = NULL;
 
-	BBitmap *cover = BTranslationUtils::GetBitmap(&image);
-	if (cover != NULL) {
-		createIcon(targetInfo, imageInfo, cover, B_MINI_ICON);
-		createIcon(targetInfo, imageInfo, cover, B_LARGE_ICON);
+	if (image == NULL && imageRef != NULL) {
+		BNode imageNode(imageRef);
+
+		imageInfo = new BNodeInfo(&imageNode);
+		if (imageInfo->InitCheck() != B_OK) {
+			delete imageInfo;
+			return;
+		}
+
+		image = BTranslationUtils::GetBitmap(imageRef);
 	}
+
+	if (image != NULL) {
+		createIcon(targetInfo, imageInfo, image, B_MINI_ICON);
+		createIcon(targetInfo, imageInfo, image, B_LARGE_ICON);
+		if (imageRef != NULL)
+			delete image;
+	}
+
+	delete imageInfo;
 }
 
 
@@ -496,6 +563,7 @@ handleDirectory(BEntry &entry, int32 level)
 	albumAttrs.length = 0;
 	albumAttrs.min_year = 0;
 	albumAttrs.max_year = 0;
+	albumAttrs.cover = NULL;
 
 	BMessage images;
 
@@ -541,6 +609,10 @@ handleDirectory(BEntry &entry, int32 level)
 				albumAttrs.genre = "Soundtrack";
 			else if (audioAttrs.genre != albumAttrs.genre)
 				albumAttrs.genre = "Misc";
+
+			// Use the first cover that we find
+			if (albumAttrs.cover == NULL && audioAttrs.cover != NULL)
+				albumAttrs.cover = audioAttrs.cover;
 
 			if (audioAttrs.length > 0)
 				albumAttrs.length += audioAttrs.length;
@@ -627,10 +699,14 @@ handleDirectory(BEntry &entry, int32 level)
 		writeAttributeString(node, "Album:Year", buffer, gForce);
 	}
 
-	if (gCreateCoverIcons && collectImages(entry, images) > 0) {
-		entry_ref cover;
-		if (chooseCover(images, cover) == B_OK)
-			createCoverIcons(entry, cover);
+	if (gCreateCoverIcons) {
+		if (albumAttrs.cover != NULL) {
+			createCoverIcons(entry, albumAttrs.cover, NULL);
+		} else if (collectImages(entry, images) > 0) {
+			entry_ref cover;
+			if (chooseCover(images, cover) == B_OK)
+				createCoverIcons(entry, NULL, &cover);
+		}
 	}
 
 	return true;
